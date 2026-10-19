@@ -385,6 +385,26 @@ fn save_order(env: &Env, order: &Order) {
     extend_order_ttl(env);
 }
 
+/// How much of `owner`'s `owned_amount_or_bps` position in `invoice_id` /
+/// `kind` is still uncommitted to other open listings or resting ask orders.
+///
+/// #1516: this used to walk the owner's *entire lifetime* `LISTING_IDS_SELLER`
+/// and `ORDER_IDS_OWNER` index vectors, which are append-only (cancelled,
+/// filled and expired ids are never removed, and they back the public
+/// "open and closed" / "any status" views), so the cost of every ask-side
+/// `list_position` / `place_order` grew without bound for an active
+/// participant. Only commitments on *this* invoice and kind can matter, and
+/// both are already tracked by indexes with hard caps:
+///
+/// - open listings live in `LISTING_IDS_INV[invoice_id]`, capped at
+///   `MAX_LISTINGS_PER_INVOICE`;
+/// - open / partially-filled orders are exactly the orders resting in
+///   `BOOK_ASKS[book_key(invoice_id, kind)]` (an order is on the book iff it
+///   has `remaining > 0` and has not been cancelled or expired), capped at
+///   `MAX_ORDERS_PER_BOOK_SIDE`.
+///
+/// So the scan is bounded by those constants, independent of the owner's
+/// history. Results are identical to the old full-history scan.
 fn available_commitment_capacity(
     env: &Env,
     invoice_id: u64,
@@ -394,14 +414,12 @@ fn available_commitment_capacity(
 ) -> Option<u64> {
     let mut committed = 0u64;
 
-    let seller_map: Map<Address, Vec<u64>> = env
+    let invoice_map: Map<u64, Vec<u64>> = env
         .storage()
         .instance()
-        .get(&LISTING_IDS_SELLER)
+        .get(&LISTING_IDS_INV)
         .unwrap_or_else(|| Map::new(env));
-    let listing_ids = seller_map
-        .get(owner.clone())
-        .unwrap_or_else(|| Vec::new(env));
+    let listing_ids = invoice_map.get(invoice_id).unwrap_or_else(|| Vec::new(env));
     for listing_id in listing_ids.iter() {
         let Some(listing) = load_listing(env, listing_id) else {
             continue;
@@ -416,13 +434,13 @@ fn available_commitment_capacity(
         committed = committed.checked_add(listing.amount_or_bps)?;
     }
 
-    let owner_map: Map<Address, Vec<u64>> = env
+    let asks: Map<u64, Vec<u64>> = env
         .storage()
         .instance()
-        .get(&ORDER_IDS_OWNER)
+        .get(&BOOK_ASKS)
         .unwrap_or_else(|| Map::new(env));
-    let order_ids = owner_map
-        .get(owner.clone())
+    let order_ids = asks
+        .get(book_key(invoice_id, kind))
         .unwrap_or_else(|| Vec::new(env));
     for order_id in order_ids.iter() {
         let Some(order) = load_order(env, order_id) else {
@@ -1406,7 +1424,14 @@ impl SecondaryMarket {
             Vec::from_array(&env, [token.into_val(&env)]),
         );
         let via_rate = if rate > 0 && capital_ahead > 0 {
-            Some((capital_ahead / rate) as u64)
+            // `capital_ahead / rate` is a non-negative i128 that can exceed
+            // u64::MAX for a pathologically large `capital_ahead` against a
+            // tiny `rate`. An `as u64` cast would silently wrap instead of
+            // saturating, defeating the `.clamp(..)` below; `u64::try_from`
+            // rejects the out-of-range value instead, so it saturates
+            // correctly to MAX_WAIT_ESTIMATE_SECS via the clamp.
+            let quotient = capital_ahead / rate;
+            Some(u64::try_from(quotient).unwrap_or(u64::MAX))
         } else if capital_ahead <= 0 {
             Some(0)
         } else {
@@ -1467,16 +1492,28 @@ impl SecondaryMarket {
             Vec::from_array(&env, [token.into_val(&env)]),
         );
 
-        let mut points = Vec::new(&env);
-        for day in 1..=horizon {
-            let horizon_ts = now.saturating_add((day as u64) * SECS_PER_DAY);
-            let mut expected_repayments: i128 = 0;
-            for invoice in open_invoices.iter() {
-                if invoice.due_date <= horizon_ts {
-                    let outstanding = invoice.principal.saturating_sub(invoice.repaid_amount);
-                    expected_repayments = expected_repayments.saturating_add(outstanding);
-                }
+        // Bucket each invoice's outstanding principal by the first forecast
+        // day on which it becomes due (`due_date <= horizon_ts`), then take
+        // a running prefix sum across days. Once an invoice is due by some
+        // day it stays due for every later day, so this reproduces exactly
+        // what the old O(horizon_days * invoices) nested scan computed, in
+        // O(horizon_days + invoices) instead: one bucket pass over the
+        // invoices, then one forward pass over the (bounded, <= 365) days.
+        let mut repayments_by_day = [0i128; (MAX_FORECAST_HORIZON_DAYS as usize) + 1];
+        for invoice in open_invoices.iter() {
+            let outstanding = invoice.principal.saturating_sub(invoice.repaid_amount);
+            let delta = invoice.due_date.saturating_sub(now);
+            let first_due_day = (delta.saturating_add(SECS_PER_DAY - 1) / SECS_PER_DAY).max(1);
+            if first_due_day <= horizon as u64 {
+                let idx = first_due_day as usize;
+                repayments_by_day[idx] = repayments_by_day[idx].saturating_add(outstanding);
             }
+        }
+
+        let mut points = Vec::new(&env);
+        let mut expected_repayments: i128 = 0;
+        for day in 1..=horizon {
+            expected_repayments = expected_repayments.saturating_add(repayments_by_day[day as usize]);
             let extrapolated_inflow = rate.saturating_mul((day as i128) * SECS_PER_DAY as i128);
             let projected_available = current_liquidity
                 .saturating_add(expected_repayments)

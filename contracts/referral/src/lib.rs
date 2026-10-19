@@ -435,10 +435,8 @@ impl ReferralContract {
             panic_with_error!(&env, ReferralError::SelfReferral);
         }
         // #1348: prevent two-party referral cycles.
-        if let Some(existing_referrer_of_referrer) = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Referrer(referrer.clone()))
+        if let Some(existing_referrer_of_referrer) =
+            env.storage().persistent().get::<DataKey, Address>(&DataKey::Referrer(referrer.clone()))
         {
             if existing_referrer_of_referrer == referee {
                 panic_with_error!(&env, ReferralError::ReferralCycle);
@@ -618,6 +616,9 @@ impl ReferralContract {
         env.storage()
             .persistent()
             .set(&reward_key, &(current_pending - actual_claim_amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&reward_key, REGISTRY_TTL, REGISTRY_TTL);
         bump_instance(&env);
 
         token_client.transfer(

@@ -37,12 +37,14 @@ pub trait InvoiceContract {
     fn get_invoice_verification_state(env: Env, id: u64) -> (bool, i128);
 }
 
+// Pagination constants for oracle round history
 const LEDGERS_PER_DAY: u32 = 17_280;
 const REGISTRY_TTL: u32 = LEDGERS_PER_DAY * 365;
 const DEFAULT_REQUIRED_VOTES: u32 = 3;
 const DEFAULT_QUORUM_BPS: u32 = 6_600; // two-thirds
 const DEFAULT_ROUND_DURATION_SECS: u64 = 3 * 24 * 60 * 60; // 3 days
 const DEFAULT_DEREGISTER_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+const MAX_ORACLE_ROUND_HISTORY: u32 = 100;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -85,6 +87,7 @@ pub enum OracleRegistryError {
     // withdraw_slashed_funds is only usable when no treasury is configured —
     // once one is, slash_oracle forwards slashed funds there automatically.
     TreasuryAlreadyConfigured = 27,
+    InvalidPagination = 28,
 }
 
 #[contracttype]
@@ -180,6 +183,7 @@ pub enum DataKey {
     OpenRounds,
     QuorumTiers,
     OracleRounds(Address),
+    OracleRoundCount(Address),
     // #1042: multisig trust anchor. Additive — untouched, this stays unset
     // and every admin-gated entrypoint above works exactly as before.
     AccessControl,
@@ -267,6 +271,8 @@ impl OracleRegistryContract {
         let mut config = Self::load_config(&env)?;
         config.treasury = treasury;
         env.storage().instance().set(&DataKey::Config, &config);
+        env.events()
+            .publish((EVT, symbol_short!("trs_set")), admin);
         Ok(())
     }
 
@@ -831,7 +837,11 @@ impl OracleRegistryContract {
     /// reaching quorum, moving it to `Expired` so `admin_resolve_round` (or a
     /// fresh `open_verification_round`) can take over. Also invoked lazily
     /// from `submit_vote` when a stale vote arrives after the deadline.
+    ///
+    /// #1370: refused while the registry is paused, so a round awaiting
+    /// consensus can't be moved to a terminal state during a pause.
     pub fn expire_round(env: Env, invoice_id: u64) -> Result<(), OracleRegistryError> {
+        require_not_paused(&env);
         let round_key = DataKey::Round(invoice_id);
         let mut round: VerificationRound = env
             .storage()
@@ -947,6 +957,8 @@ impl OracleRegistryContract {
     }
 
     pub fn get_oracle_round_history(env: Env, oracle: Address) -> Vec<(u64, bool, String)> {
+        // Legacy full-history read retained for backward compatibility, but
+        // bounded by MAX_ORACLE_ROUND_HISTORY to prevent unbounded growth.
         let key = DataKey::OracleRounds(oracle.clone());
         let ids: Vec<u64> = env
             .storage()
@@ -954,7 +966,8 @@ impl OracleRegistryContract {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         let mut out = Vec::new(&env);
-        for i in 0..ids.len() {
+        let start = ids.len().saturating_sub(MAX_ORACLE_ROUND_HISTORY);
+        for i in start..ids.len() {
             let invoice_id = ids.get(i).unwrap();
             let round: Option<VerificationRound> =
                 env.storage().persistent().get(&DataKey::Round(invoice_id));
@@ -965,6 +978,43 @@ impl OracleRegistryContract {
             }
         }
         out
+    }
+
+    /// Paginated read of an oracle's round history. `offset` is the index into
+    /// the (bounded) stored history and `limit` caps the number of entries
+    /// returned. Rejects `limit == 0` or `limit > MAX_ORACLE_ROUND_HISTORY`.
+    pub fn get_oracle_round_history_paginated(
+        env: Env,
+        oracle: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<(u64, bool, String)>, OracleRegistryError> {
+        if limit == 0 || limit > MAX_ORACLE_ROUND_HISTORY {
+            return Err(OracleRegistryError::InvalidPagination);
+        }
+        let key = DataKey::OracleRounds(oracle.clone());
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut out = Vec::new(&env);
+        let len = ids.len();
+        if offset >= len {
+            return Ok(out);
+        }
+        let end = offset.saturating_add(limit).min(len);
+        for i in offset..end {
+            let invoice_id = ids.get(i).unwrap();
+            let round: Option<VerificationRound> =
+                env.storage().persistent().get(&DataKey::Round(invoice_id));
+            if let Some(r) = round {
+                if let Some(approved) = r.votes.get(oracle.clone()) {
+                    out.push_back((invoice_id, approved, r.oracle_hash.clone()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn get_oracle_reputation(env: Env, operator: Address) -> Option<OracleReputation> {
@@ -978,13 +1028,18 @@ impl OracleRegistryContract {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleRoundCount(operator.clone()))
+            .unwrap_or(ids.len());
         Some(OracleReputation {
             address: operator,
             is_active: info.is_active,
             total_verifications: info.total_verifications,
             total_slashes: info.total_slashes,
             registered_at: info.registered_at,
-            rounds_participated: ids.len(),
+            rounds_participated: count,
         })
     }
 
@@ -997,10 +1052,27 @@ impl OracleRegistryContract {
             .unwrap_or_else(|| Vec::new(env));
         if !ids.contains(invoice_id) {
             ids.push_back(invoice_id);
+            // Bound the stored history so a long-lived active oracle's vector
+            // can't grow without limit. Drop the oldest entries first.
+            while ids.len() > MAX_ORACLE_ROUND_HISTORY {
+                ids.remove(0);
+            }
             env.storage().persistent().set(&key, &ids);
             env.storage()
                 .persistent()
                 .extend_ttl(&key, REGISTRY_TTL, REGISTRY_TTL);
+            let count_key = DataKey::OracleRoundCount(oracle.clone());
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&count_key)
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&count_key, &count.saturating_add(1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&count_key, REGISTRY_TTL, REGISTRY_TTL);
         }
     }
 
@@ -1031,7 +1103,7 @@ impl OracleRegistryContract {
         env.storage().instance().get(&DataKey::AccessControl)
     }
 
-     // #1038: Bootstrap the governance contract address. Admin-gated one-time setup.
+    // #1038: Bootstrap the governance contract address. Admin-gated one-time setup.
     pub fn set_governance_address(
         env: Env,
         admin: Address,
@@ -1174,7 +1246,9 @@ impl OracleRegistryContract {
     // ---- #1038: Governance-gated parameter changes ----
 
     // #1038: Set invoice contract via governance proposal.
-    pub fn set_invoice_contract_via_governance(
+    // Shortened from `set_invoice_contract_via_governance` (35 chars) to fit
+    // Soroban's 32-char function-name limit.
+    pub fn set_invoice_contract_gov(
         env: Env,
         governance: Address,
         invoice_contract: Address,
@@ -1184,8 +1258,10 @@ impl OracleRegistryContract {
         env.storage()
             .instance()
             .set(&DataKey::InvoiceContract, &invoice_contract);
-        env.events()
-            .publish((EVT, symbol_short!("gov_inv")), (governance, invoice_contract));
+        env.events().publish(
+            (EVT, symbol_short!("gov_inv")),
+            (governance, invoice_contract),
+        );
         Ok(())
     }
 
@@ -1198,7 +1274,7 @@ impl OracleRegistryContract {
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
         let mut config = Self::load_config(&env)?;
-        config.treasury = treasury;
+        config.treasury = treasury.clone();
         env.storage().instance().set(&DataKey::Config, &config);
         env.events()
             .publish((EVT, symbol_short!("gov_treas")), (governance, treasury));
@@ -1206,8 +1282,10 @@ impl OracleRegistryContract {
     }
 
     // #1038: Set registry config via governance proposal.
+    // Shortened from `set_registry_config_via_governance` (34 chars) to fit
+    // Soroban's 32-char function-name limit.
     #[allow(clippy::too_many_arguments)]
-    pub fn set_registry_config_via_governance(
+    pub fn set_registry_config_gov(
         env: Env,
         governance: Address,
         min_stake: i128,
@@ -1264,7 +1342,7 @@ impl OracleRegistryContract {
         }
         env.storage().instance().set(&DataKey::QuorumTiers, &tiers);
         env.events()
-            .publish((EVT, symbol_short!("gov_quorum")), (governance, tiers.len()));
+            .publish((EVT, symbol_short!("gov_qrum")), (governance, tiers.len()));
         Ok(())
     }
 

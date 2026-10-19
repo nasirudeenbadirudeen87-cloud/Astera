@@ -797,6 +797,44 @@ fn get_config_cached(env: &Env) -> PoolResult<PoolConfig> {
         .ok_or(PoolError::NotInitialized)
 }
 
+// Helpers for the governance-gated setters: pool parameters live in the
+// single `DataKey::Config` entry (there is no per-parameter DataKey variant —
+// the enum is at Soroban's 50-variant ceiling), so each setter loads the
+// config, patches one field and writes it back.
+fn update_config_field(
+    env: &Env,
+    patch: impl FnOnce(&mut PoolConfig),
+) -> PoolResult<PoolConfig> {
+    let mut config = get_config_cached(env)?;
+    patch(&mut config);
+    env.storage().instance().set(&DataKey::Config, &config);
+    Ok(config)
+}
+
+fn config_with_min_deposit(env: &Env, min_amount: i128) -> PoolResult<PoolConfig> {
+    update_config_field(env, |c| c.min_deposit_amount = min_amount)
+}
+
+fn config_with_conc(env: &Env, max_bps: u32) -> PoolResult<PoolConfig> {
+    update_config_field(env, |c| c.max_single_investor_bps = max_bps)
+}
+
+fn config_with_factoring_fee(env: &Env, factoring_fee_bps: u32) -> PoolResult<PoolConfig> {
+    update_config_field(env, |c| c.factoring_fee_bps = factoring_fee_bps)
+}
+
+fn config_with_wd_limit(env: &Env, max_bps: u32) -> PoolResult<PoolConfig> {
+    update_config_field(env, |c| c.max_single_withdrawal_bps = max_bps)
+}
+
+fn config_with_wd_age(env: &Env, days: u32) -> PoolResult<PoolConfig> {
+    update_config_field(env, |c| c.max_withdrawal_queue_age_days = days)
+}
+
+fn config_with_wd_depth(env: &Env, depth: u32) -> PoolResult<PoolConfig> {
+    update_config_field(env, |c| c.max_withdrawal_queue_depth = depth)
+}
+
 // Optimized bump that only extends if needed
 fn bump_instance(env: &Env) {
     env.storage()
@@ -2106,23 +2144,24 @@ impl FundingPool {
         }
 
         // Check 4: No active co-funding commitments in this token (#567)
-        // Scan all FundedInvoice records to find any in co-funding phase with commitments in this token
-        let stats: PoolStorageStats = env
+        // Enumerate only invoices funded against this token via the per-token index
+        // (TokenInvoiceIds), instead of scanning every funded invoice ever recorded
+        // across all tokens — total_funded_invoices only ever grows, so the old scan
+        // became prohibitively expensive as the pool's lifetime invoice count grew.
+        let token_invoice_ids: Vec<u64> = env
             .storage()
-            .instance()
-            .get(&DataKey::StorageStats)
-            .unwrap_or_default();
+            .persistent()
+            .get(&DataKey::TokenInvoiceIds(token.clone()))
+            .unwrap_or(Vec::new(env));
 
-        for invoice_idx in 0..stats.total_funded_invoices {
+        for i in 0..token_invoice_ids.len() {
+            let invoice_id = token_invoice_ids.get(i).ok_or(PoolError::StorageCorrupted)?;
             if let Some(funded_invoice) = env
                 .storage()
                 .persistent()
-                .get::<DataKey, FundedInvoice>(&DataKey::FundedInvoice(invoice_idx))
+                .get::<DataKey, FundedInvoice>(&DataKey::FundedInvoice(invoice_id))
             {
-                // Check if this funded invoice uses the target token
                 if &funded_invoice.token == token {
-                    // Found an active funded invoice using this token
-                    // This represents a co-funding commitment that must be settled before removal
                     return Err(PoolError::TokenHasActiveCofundingCommitments);
                 }
             }
@@ -3828,26 +3867,40 @@ impl FundingPool {
                 return Err(PoolError::CollateralAlreadySettled);
             }
 
-            // Credit the seized collateral into the pool's token totals so investors benefit.
-            let token_totals_key = DataKey::TokenTotals(col.token.clone());
-            let mut tt: PoolTokenTotals = env
+            // Write off the defaulted invoice's principal against the LOAN token's totals
+            // (record.token). The principal receivable is no longer an asset, and
+            // total_deployed drops by the full principal since the invoice is no longer
+            // outstanding. When the collateral token equals the loan token this nets out
+            // identically to the previous single-token accounting.
+            let loan_tt_key = DataKey::TokenTotals(record.token.clone());
+            let mut loan_tt: PoolTokenTotals = env
                 .storage()
                 .instance()
-                .get(&token_totals_key)
+                .get(&loan_tt_key)
                 .unwrap_or_default();
-
-            // The defaulted invoice's principal is a receivable that pool_value already
-            // counts as an asset (via total_deployed) — it must be written off here, offset
-            // by whatever collateral was actually recovered, or pool_value silently overstates
-            // investor claims by the unrecovered shortfall. total_deployed drops by the full
-            // principal regardless, since the invoice is no longer outstanding either way.
-            tt.pool_value = tt
+            loan_tt.pool_value = loan_tt
                 .pool_value
                 .checked_sub(record.principal)
-                .and_then(|v| v.checked_add(col.amount))
                 .ok_or(PoolError::AmountOverflow)?;
-            tt.total_deployed -= record.principal;
-            env.storage().instance().set(&token_totals_key, &tt);
+            loan_tt.total_deployed = loan_tt
+                .total_deployed
+                .checked_sub(record.principal)
+                .ok_or(PoolError::AmountOverflow)?;
+            env.storage().instance().set(&loan_tt_key, &loan_tt);
+
+            // Credit the recovered collateral into the COLLATERAL token's totals
+            // (col.token) so investors benefit from the seizure proceeds.
+            let col_tt_key = DataKey::TokenTotals(col.token.clone());
+            let mut col_tt: PoolTokenTotals = env
+                .storage()
+                .instance()
+                .get(&col_tt_key)
+                .unwrap_or_default();
+            col_tt.pool_value = col_tt
+                .pool_value
+                .checked_add(col.amount)
+                .ok_or(PoolError::AmountOverflow)?;
+            env.storage().instance().set(&col_tt_key, &col_tt);
 
             col.settled = true;
             col.seized_at = now;
@@ -3983,7 +4036,7 @@ impl FundingPool {
             .instance()
             .get(&DataKey::Config)
             .ok_or(PoolError::NotInitialized)?;
-        if config.proposed_yield_bps == 0 || config.yield_proposal_at == 0 {
+        if config.yield_proposal_at == 0 {
             return Err(PoolError::YieldProposalNotFound);
         }
 
@@ -4338,6 +4391,10 @@ impl FundingPool {
         env.storage()
             .instance()
             .set(&DataKey::CreditScoreContract, &credit_score_contract);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("cfg_upd")),
+            credit_score_contract,
+        );
         Ok(())
     }
 
@@ -4358,6 +4415,10 @@ impl FundingPool {
         env.storage()
             .instance()
             .set(&INSURANCE_CFG, &insurance_contract);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("cfg_upd")),
+            insurance_contract,
+        );
         Ok(())
     }
 
@@ -4858,7 +4919,7 @@ impl FundingPool {
     }
 
     // #1038: Set max utilization via governance proposal.
-    pub fn set_max_utilization_via_governance(
+    pub fn set_max_utilization_gov(
         env: Env,
         governance: Address,
         max_bps: u32,
@@ -4883,7 +4944,7 @@ impl FundingPool {
     }
 
     // #1038: Set oracle contract via governance proposal.
-    pub fn set_oracle_contract_via_governance(
+    pub fn set_oracle_contract_gov(
         env: Env,
         governance: Address,
         oracle: Address,
@@ -4911,14 +4972,14 @@ impl FundingPool {
             .instance()
             .set(&DataKey::KycRequired, &required);
         env.events().publish(
-            (EVT, symbol_short!("gov_kycreq")),
+            (EVT, symbol_short!("gov_kyc")),
             (governance, required),
         );
         Ok(())
     }
 
     // #1038: Set compliance registry via governance proposal.
-    pub fn set_compliance_registry_via_governance(
+    pub fn set_compliance_registry_gov(
         env: Env,
         governance: Address,
         registry: Address,
@@ -4934,7 +4995,7 @@ impl FundingPool {
                 registry: registry.clone(),
                 required: false,
             });
-        gate.registry = registry;
+        gate.registry = registry.clone();
         env.storage().instance().set(&COMPLIANCE_CFG, &gate);
         env.events().publish(
             (EVT, symbol_short!("gov_comp")),
@@ -4944,7 +5005,7 @@ impl FundingPool {
     }
 
     // #1038: Set require compliance check via governance proposal.
-    pub fn set_require_compliance_check_via_governance(
+    pub fn set_require_compliance_check_gov(
         env: Env,
         governance: Address,
         required: bool,
@@ -4957,20 +5018,20 @@ impl FundingPool {
             .instance()
             .get(&COMPLIANCE_CFG)
             .unwrap_or(ComplianceGateConfig {
-                registry: Address::generate(&env),
+                registry: Address::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWF5"),
                 required: false,
             });
         gate.required = required;
         env.storage().instance().set(&COMPLIANCE_CFG, &gate);
         env.events().publish(
-            (EVT, symbol_short!("gov_comp_req")),
+            (EVT, symbol_short!("gov_cmp_r")),
             (governance, required),
         );
         Ok(())
     }
 
     // #1038: Set referral registry via governance proposal.
-    pub fn set_referral_registry_via_governance(
+    pub fn set_referral_registry_gov(
         env: Env,
         governance: Address,
         registry: Address,
@@ -4987,7 +5048,7 @@ impl FundingPool {
     }
 
     // #1038: Set credit score contract via governance proposal.
-    pub fn set_credit_score_contract_via_governance(
+    pub fn set_credit_score_contract_gov(
         env: Env,
         governance: Address,
         credit_score_contract: Address,
@@ -5006,7 +5067,7 @@ impl FundingPool {
     }
 
     // #1038: Set insurance contract via governance proposal.
-    pub fn set_insurance_contract_via_governance(
+    pub fn set_insurance_contract_gov(
         env: Env,
         governance: Address,
         insurance_contract: Address,
@@ -5025,7 +5086,7 @@ impl FundingPool {
     }
 
     // #1038: Set compound interest via governance proposal.
-    pub fn set_compound_interest_via_governance(
+    pub fn set_compound_interest_gov(
         env: Env,
         governance: Address,
         compound: bool,
@@ -5041,14 +5102,14 @@ impl FundingPool {
         config.compound_interest = compound;
         env.storage().instance().set(&DataKey::Config, &config);
         env.events().publish(
-            (EVT, symbol_short!("gov_comp_int")),
+            (EVT, symbol_short!("gov_cmp_i")),
             (governance, compound),
         );
         Ok(())
     }
 
     // #1038: Set secondary market contract via governance proposal.
-    pub fn set_secondary_market_contract_via_governance(
+    pub fn set_secondary_market_gov(
         env: Env,
         governance: Address,
         secondary_market_contract: Address,
@@ -5058,7 +5119,7 @@ impl FundingPool {
         bump_instance(&env);
         env.storage()
             .instance()
-            .set(&SECONDARY_MARKET, &secondary_market_contract);
+            .set(&SECONDARY_MARKET_CONTRACT, &secondary_market_contract);
         env.events().publish(
             (EVT, symbol_short!("gov_sm")),
             (governance, secondary_market_contract),
@@ -5100,14 +5161,14 @@ impl FundingPool {
         }
         env.storage()
             .instance()
-            .set(&DataKey::MinDeposit, &min_amount);
+            .set(&DataKey::Config, &config_with_min_deposit(&env, min_amount)?);
         env.events()
-            .publish((EVT, symbol_short!("gov_min_dep")), (governance, min_amount));
+            .publish((EVT, symbol_short!("gov_mind")), (governance, min_amount));
         Ok(())
     }
 
     // #1038: Set max investor concentration via governance proposal.
-    pub fn set_max_investor_concentration_via_governance(
+    pub fn set_max_investor_conc_gov(
         env: Env,
         governance: Address,
         max_bps: u32,
@@ -5120,16 +5181,16 @@ impl FundingPool {
         }
         env.storage()
             .instance()
-            .set(&DataKey::MaxInvestorConcentration, &max_bps);
+            .set(&DataKey::Config, &config_with_conc(&env, max_bps)?);
         env.events().publish(
-            (EVT, symbol_short!("gov_max_conc")),
+            (EVT, symbol_short!("gov_conc")),
             (governance, max_bps),
         );
         Ok(())
     }
 
     // #1038: Set upgrade timelock via governance proposal.
-    pub fn set_upgrade_timelock_via_governance(
+    pub fn set_upgrade_timelock_gov(
         env: Env,
         governance: Address,
         secs: u64,
@@ -5143,14 +5204,14 @@ impl FundingPool {
         }
         env.storage()
             .instance()
-            .set(&DataKey::UpgradeTimelock, &secs);
+            .set(&DataKey::UpgradeTimelockSecs, &secs);
         env.events()
             .publish((EVT, symbol_short!("gov_up_tl")), (governance, secs));
         Ok(())
     }
 
     // #1038: Set operation delay via governance proposal.
-    pub fn set_operation_delay_via_governance(
+    pub fn set_operation_delay_gov(
         env: Env,
         governance: Address,
         secs: u64,
@@ -5164,14 +5225,14 @@ impl FundingPool {
         }
         env.storage()
             .instance()
-            .set(&DataKey::OperationDelay, &secs);
+            .set(&DataKey::OperationDelaySecs, &secs);
         env.events()
-            .publish((EVT, symbol_short!("gov_op_del")), (governance, secs));
+            .publish((EVT, symbol_short!("gov_opdl")), (governance, secs));
         Ok(())
     }
 
     // #1038: Set yield change policy via governance proposal.
-    pub fn set_yield_change_policy_via_governance(
+    pub fn set_yield_change_policy_gov(
         env: Env,
         governance: Address,
         cooldown_secs: u64,
@@ -5187,7 +5248,7 @@ impl FundingPool {
         config.yield_change_cooldown_secs = cooldown_secs;
         env.storage().instance().set(&DataKey::Config, &config);
         env.events().publish(
-            (EVT, symbol_short!("gov_yield_pol")),
+            (EVT, symbol_short!("gov_ycld")),
             (governance, cooldown_secs),
         );
         Ok(())
@@ -5207,7 +5268,7 @@ impl FundingPool {
         }
         env.storage()
             .instance()
-            .set(&DataKey::FactoringFeeBps, &factoring_fee_bps);
+            .set(&DataKey::Config, &config_with_factoring_fee(&env, factoring_fee_bps)?);
         env.events().publish(
             (EVT, symbol_short!("gov_fact")),
             (governance, factoring_fee_bps),
@@ -5216,7 +5277,7 @@ impl FundingPool {
     }
 
     // #1038: Set withdrawal limits via governance proposal.
-    pub fn set_withdrawal_limits_via_governance(
+    pub fn set_withdrawal_limits_gov(
         env: Env,
         governance: Address,
         max_bps: u32,
@@ -5229,16 +5290,16 @@ impl FundingPool {
         }
         env.storage()
             .instance()
-            .set(&DataKey::WithdrawalLimitBps, &max_bps);
+            .set(&DataKey::Config, &config_with_wd_limit(&env, max_bps)?);
         env.events().publish(
-            (EVT, symbol_short!("gov_wd_lim")),
+            (EVT, symbol_short!("gov_wdlm")),
             (governance, max_bps),
         );
         Ok(())
     }
 
     // #1038: Set max withdrawal queue age via governance proposal.
-    pub fn set_max_withdrawal_queue_age_via_governance(
+    pub fn set_max_wd_queue_age_gov(
         env: Env,
         governance: Address,
         days: u32,
@@ -5248,16 +5309,16 @@ impl FundingPool {
         bump_instance(&env);
         env.storage()
             .instance()
-            .set(&DataKey::MaxWithdrawalQueueAge, &days);
+            .set(&DataKey::Config, &config_with_wd_age(&env, days)?);
         env.events().publish(
-            (EVT, symbol_short!("gov_wd_age")),
+            (EVT, symbol_short!("gov_wdag")),
             (governance, days),
         );
         Ok(())
     }
 
     // #1038: Set max withdrawal queue depth via governance proposal.
-    pub fn set_max_withdrawal_queue_depth_via_governance(
+    pub fn set_max_wd_queue_depth_gov(
         env: Env,
         governance: Address,
         depth: u32,
@@ -5267,16 +5328,16 @@ impl FundingPool {
         bump_instance(&env);
         env.storage()
             .instance()
-            .set(&DataKey::MaxWithdrawalQueueDepth, &depth);
+            .set(&DataKey::Config, &config_with_wd_depth(&env, depth)?);
         env.events().publish(
-            (EVT, symbol_short!("gov_wd_dep")),
+            (EVT, symbol_short!("gov_wddp")),
             (governance, depth),
         );
         Ok(())
     }
 
     // #1038: Set oracle stale threshold via governance proposal.
-    pub fn set_oracle_stale_threshold_via_governance(
+    pub fn set_oracle_stale_thresh_gov(
         env: Env,
         governance: Address,
         threshold_secs: u64,
@@ -5285,7 +5346,7 @@ impl FundingPool {
         Self::require_governance(&env, &governance)?;
         bump_instance(&env);
         Self::require_not_paused(&env);
-        if threshold_secs == 0 || threshold_secs > MAX_ORACLE_STALE_SECS {
+        if threshold_secs == 0 {
             return Err(PoolError::InvalidAmount);
         }
         let current = env
@@ -5297,7 +5358,7 @@ impl FundingPool {
             .instance()
             .set(&ORACLE_STALE_SECS, &threshold_secs);
         env.events().publish(
-            (EVT, symbol_short!("gov_orc_stale")),
+            (EVT, symbol_short!("gov_orst")),
             (governance, current, threshold_secs),
         );
         Ok(())
@@ -5378,7 +5439,7 @@ impl FundingPool {
     }
 
     // #1038: Set fallback price via governance proposal.
-    pub fn set_fallback_price_via_governance(
+    pub fn set_fallback_price_gov(
         env: Env,
         governance: Address,
         token: Address,
@@ -5391,11 +5452,17 @@ impl FundingPool {
         if price <= 0 {
             return Err(PoolError::InvalidAmount);
         }
-        env.storage()
+        // Same storage as the admin setter (#1036): map of token ->
+        // (price, set_at) so get_asset_price can bound staleness.
+        let mut prices: Map<Address, (i128, u64)> = env
+            .storage()
             .instance()
-            .set(&DataKey::FallbackPrice(token), &price);
+            .get(&ORACLE_FALLBACK_PX)
+            .unwrap_or_else(|| Map::new(&env));
+        prices.set(token.clone(), (price, env.ledger().timestamp()));
+        env.storage().instance().set(&ORACLE_FALLBACK_PX, &prices);
         env.events()
-            .publish((EVT, symbol_short!("gov_fallback")), (governance, token, price));
+            .publish((EVT, symbol_short!("gov_fbp")), (governance, token, price));
         Ok(())
     }
 
@@ -5404,21 +5471,24 @@ impl FundingPool {
         env: Env,
         governance: Address,
         token: Address,
-        min_rate: i128,
-        max_rate: i128,
+        min_bps: u32,
+        max_bps: u32,
     ) -> Result<(), PoolError> {
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
         bump_instance(&env);
         Self::require_not_paused(&env);
-        if min_rate < 0 || max_rate <= min_rate {
+        if min_bps == 0 || max_bps == 0 || min_bps > max_bps {
             return Err(PoolError::InvalidAmount);
         }
         env.storage()
             .instance()
-            .set(&DataKey::RateBounds(token), &(min_rate, max_rate));
+            .set(
+                &DataKey::ExchangeRateBounds(token.clone()),
+                &ExchangeRateBounds { min_bps, max_bps },
+            );
         env.events()
-            .publish((EVT, symbol_short!("gov_rate")), (governance, token, min_rate, max_rate));
+            .publish((EVT, symbol_short!("gov_rate")), (governance, token, min_bps, max_bps));
         Ok(())
     }
 
@@ -5427,25 +5497,25 @@ impl FundingPool {
         env: Env,
         governance: Address,
         token: Address,
-        rate: i128,
+        rate_bps: u32,
     ) -> Result<(), PoolError> {
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
         bump_instance(&env);
         Self::require_not_paused(&env);
-        if rate <= 0 {
+        if rate_bps == 0 {
             return Err(PoolError::InvalidAmount);
         }
         env.storage()
             .instance()
-            .set(&DataKey::ExchangeRate(token), &rate);
+            .set(&DataKey::ExchangeRate(token.clone()), &rate_bps);
         env.events()
-            .publish((EVT, symbol_short!("gov_exch")), (governance, token, rate));
+            .publish((EVT, symbol_short!("gov_exch")), (governance, token, rate_bps));
         Ok(())
     }
 
     // #1038: Set collateral config via governance proposal.
-    pub fn set_collateral_config_via_governance(
+    pub fn set_collateral_config_gov(
         env: Env,
         governance: Address,
         config: CollateralConfig,

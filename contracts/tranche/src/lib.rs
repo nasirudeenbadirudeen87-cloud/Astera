@@ -10,7 +10,7 @@ pub mod state;
 pub mod withdraw;
 
 use errors::TrancheError;
-use events::{CONFIG, EVT};
+use events::{CONFIG, EVT, OPENED, PAUSED};
 use state::{DataKey, TrancheAccounting, TrancheClass, TrancheConfig, TranchePool};
 
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env};
@@ -64,6 +64,30 @@ impl TrancheContract {
         admin.require_auth();
     }
 
+    /// Persist a pool together with its `TrancheEnabled` flag. Both
+    /// pool-creation paths (`initialize` and `open_tranche_for_token`) go
+    /// through here so a live pool can never report
+    /// `is_tranche_enabled == false`. (#1295)
+    fn store_enabled_pool(env: &Env, token: &Address, pool: &TranchePool) {
+        env.storage()
+            .instance()
+            .set(&DataKey::Pool(token.clone()), pool);
+        env.storage()
+            .instance()
+            .set(&DataKey::TrancheEnabled(token.clone()), &true);
+    }
+
+    fn require_not_paused(env: &Env) {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(env, TrancheError::ContractPaused);
+        }
+    }
+
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -78,7 +102,10 @@ impl TrancheContract {
             panic_with_error!(&env, TrancheError::AlreadyInitialized);
         }
 
+        Self::validate_share_tokens(&env, &senior_share_token, &junior_share_token);
+
         admin.require_auth();
+        Self::validate_config(&env, &config);
 
         env.storage().instance().set(&DataKey::Admin, &admin);
 
@@ -91,7 +118,7 @@ impl TrancheContract {
             junior: TrancheAccounting::default(),
         };
 
-        env.storage().instance().set(&DataKey::Pool(token), &pool);
+        Self::store_enabled_pool(&env, &token, &pool);
     }
 
     pub fn get_pool(env: Env, token: Address) -> TranchePool {
@@ -130,6 +157,7 @@ impl TrancheContract {
         amount: i128,
     ) {
         Self::bump_instance(&env);
+        Self::require_not_paused(&env);
         Self::non_reentrant_start(&env);
         deposit::deposit(&env, investor, token, tranche, amount);
         Self::non_reentrant_end(&env);
@@ -143,6 +171,7 @@ impl TrancheContract {
         amount: i128,
     ) {
         Self::bump_instance(&env);
+        Self::require_not_paused(&env);
         Self::non_reentrant_start(&env);
         withdraw::withdraw(&env, investor, token, tranche, amount);
         Self::non_reentrant_end(&env);
@@ -208,6 +237,17 @@ impl TrancheContract {
         }
     }
 
+    /// The senior and junior classes must be tracked by *different* share
+    /// tokens. If both point at the same address, `deposit` mints and
+    /// `withdraw` burns against one token for both classes, so senior and
+    /// junior holders end up sharing a single fungible claim and the
+    /// waterfall's seniority guarantee is gone. (#1303)
+    fn validate_share_tokens(env: &Env, senior_share_token: &Address, junior_share_token: &Address) {
+        if senior_share_token == junior_share_token {
+            panic_with_error!(env, TrancheError::InvalidShareTokens);
+        }
+    }
+
     pub fn set_tranche_config(
         env: Env,
         admin: Address,
@@ -270,33 +310,33 @@ impl TrancheContract {
         }
 
         Self::validate_config(&env, &config);
+        Self::validate_share_tokens(&env, &senior_share_token, &junior_share_token);
 
-        if env
+        let pool = if let Some(existing) = env
             .storage()
             .instance()
-            .has(&DataKey::Pool(token.clone()))
+            .get::<DataKey, TranchePool>(&DataKey::Pool(token.clone()))
         {
-            panic_with_error!(&env, TrancheError::AlreadyInitialized);
-        }
-
-        let pool = TranchePool {
-            token: token.clone(),
-            senior_share_token,
-            junior_share_token,
-            config,
-            senior: TrancheAccounting::default(),
-            junior: TrancheAccounting::default(),
+            let mut p = existing;
+            p.senior_share_token = senior_share_token;
+            p.junior_share_token = junior_share_token;
+            p.config = config;
+            p
+        } else {
+            TranchePool {
+                token: token.clone(),
+                senior_share_token,
+                junior_share_token,
+                config,
+                senior: TrancheAccounting::default(),
+                junior: TrancheAccounting::default(),
+            }
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Pool(token.clone()), &pool);
-        env.storage()
-            .instance()
-            .set(&DataKey::TrancheEnabled(token.clone()), &true);
+        Self::store_enabled_pool(&env, &token, &pool);
 
         env.events().publish(
-            (EVT, CONFIG),
+            (EVT, OPENED),
             (
                 token,
                 config.senior_target_yield_bps,
@@ -321,6 +361,7 @@ impl TrancheContract {
         total_amount: i128,
     ) -> (i128, i128) {
         Self::bump_instance(&env);
+        Self::require_not_paused(&env);
         Self::require_admin_auth(&env);
         Self::non_reentrant_start(&env);
         let result = funding::fund_invoice_from_tranches(&env, token, invoice_id, total_amount);
@@ -343,6 +384,7 @@ impl TrancheContract {
         elapsed_secs: u64,
     ) -> (i128, i128) {
         Self::bump_instance(&env);
+        Self::require_not_paused(&env);
         Self::require_admin_auth(&env);
         Self::non_reentrant_start(&env);
         let result = repayment::distribute_waterfall_repayment(
@@ -358,6 +400,7 @@ impl TrancheContract {
 
     pub fn allocate_loss(env: Env, token: Address, invoice_id: u64, shortfall: i128) {
         Self::bump_instance(&env);
+        Self::require_not_paused(&env);
         Self::require_admin_auth(&env);
         Self::non_reentrant_start(&env);
         repayment::allocate_loss(&env, token, invoice_id, shortfall);
@@ -383,6 +426,7 @@ impl TrancheContract {
             hypothetical_repayment,
             exposure.senior_deployed,
             pool.config.senior_target_yield_bps,
+            pool.config.junior_first_loss_bps,
             elapsed_secs,
         )
     }
@@ -411,5 +455,43 @@ impl TrancheContract {
         // Convert to basis points (lifetime, not annualized — see get_lifetime_return_bps).
         let return_bps = (total_return * 10_000) / accounting.deposited;
         return_bps.min(u32::MAX as i128) as u32
+    }
+
+    pub fn pause(env: Env, admin: Address) -> Result<(), TrancheError> {
+        Self::bump_instance(&env);
+        admin.require_auth();
+
+        let stored_admin = Self::get_admin(env.clone())?;
+        if admin != stored_admin {
+            panic_with_error!(&env, TrancheError::Unauthorized);
+        }
+
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events()
+            .publish((EVT, PAUSED), (admin, env.ledger().timestamp()));
+        Ok(())
+    }
+
+    pub fn unpause(env: Env, admin: Address) -> Result<(), TrancheError> {
+        Self::bump_instance(&env);
+        admin.require_auth();
+
+        let stored_admin = Self::get_admin(env.clone())?;
+        if admin != stored_admin {
+            panic_with_error!(&env, TrancheError::Unauthorized);
+        }
+
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((EVT, PAUSED), (admin, env.ledger().timestamp()));
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        Self::bump_instance(&env);
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
     }
 }
